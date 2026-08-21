@@ -1,0 +1,2 @@
+# modsync
+Minecraft mod manager
