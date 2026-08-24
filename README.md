@@ -20,6 +20,14 @@ npm run lint
 npm run build
 ```
 
+## Analytics
+
+ModSync supports optional privacy-conscious analytics through Umami Cloud. It measures page views and product actions such as searches, library changes, compatibility checks, recommendations, support, feedback exports, and downloads. It does not collect emails, usernames, IP addresses, search text, messages, URLs with personal data, or mod/file contents.
+
+Analytics is disabled unless both `VITE_UMAMI_WEBSITE_ID` and `VITE_UMAMI_SCRIPT_URL` are configured. In Umami Cloud, create or open the ModSync website under **Settings -> Websites**, copy its Website ID, then copy `.env.example` to `.env` and set the ID. Use `https://cloud.umami.is/script.js` for Umami Cloud. Analytics loads only after the user accepts the in-app opt-in notice; declining it disables tracking. Removing the variables disables it entirely.
+
+After deployment, view visitors, page views, and custom events in the Umami Cloud dashboard by opening the ModSync website and selecting **Analytics**. No production analytics is active in this repository until a real Umami Website ID is supplied. Local development with empty variables generates no analytics traffic.
+
 ## Windows desktop build
 
 The Tauri desktop app detects the standard Windows Java Edition directory at
