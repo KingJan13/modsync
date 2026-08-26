@@ -12,7 +12,7 @@ struct MinecraftInstallation {
     versions_directory: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetupManifest {
     format: String,
@@ -21,13 +21,13 @@ struct SetupManifest {
     mods: Vec<SetupMod>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MinecraftSetup {
     version: String,
     loader: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetupMod {
     project_id: String,
