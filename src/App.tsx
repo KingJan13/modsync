@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { ChangeEvent, FormEvent } from 'react'
 import {
   getAnalyticsConsent,
   initialiseAnalytics,
@@ -7,6 +7,8 @@ import {
   setAnalyticsConsent,
   trackEvent,
 } from './lib/analytics'
+import { accountService } from './lib/account'
+import type { AccountProfile } from './lib/account'
 
 type MinecraftInstallation = {
   found: boolean
@@ -217,10 +219,39 @@ type DownloadItem = {
   isDependency: boolean
 }
 
+type SetupManifest = {
+  format: 'modsync-setup'
+  formatVersion: 1
+  exportedAt: string
+  minecraft: { version: string; loader: string }
+  mods: Array<{
+    projectId: string
+    title: string
+    versionId?: string
+    versionNumber?: string
+    fileName?: string
+    downloadUrl?: string
+    isDependency: boolean
+    dependencies: string[]
+  }>
+}
+
+type InstallationValidation = {
+  valid: boolean
+  minecraft_directory: string
+  mods_directory: string
+  reason?: string
+}
+
+type DesktopInstallResult = {
+  installed: string[]
+  failed: Array<{ fileName: string; reason: string }>
+}
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: {
-      invoke<T>(command: string): Promise<T>
+      invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
     }
   }
 }
@@ -238,6 +269,7 @@ const LOADER_CATEGORIES = {
 const LIBRARY_STORAGE_KEY = 'modsync-library'
 const VERSION_STORAGE_KEY = 'modsync-minecraft-version'
 const LOADER_STORAGE_KEY = 'modsync-loader'
+const DESKTOP_DOWNLOAD_URL = ''
 
 function readLibrary(): ModrinthSearchHit[] {
   try {
@@ -348,7 +380,7 @@ function App() {
   const [error, setError] = useState('')
   const [library, setLibrary] = useState<ModrinthSearchHit[]>(readLibrary)
   const [libraryFeedback, setLibraryFeedback] = useState('')
-  const [activeView, setActiveView] = useState<'discover' | 'recommendations' | 'search' | 'library' | 'plan' | 'feedback' | 'support' | 'privacy'>('discover')
+  const [activeView, setActiveView] = useState<'discover' | 'recommendations' | 'search' | 'library' | 'compatibility' | 'plan' | 'desktop' | 'feedback' | 'support' | 'privacy'>('discover')
   const [feedbackType, setFeedbackType] = useState('Bug report')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [feedbackEmail, setFeedbackEmail] = useState('')
@@ -371,8 +403,23 @@ function App() {
   const [minecraftInstallation, setMinecraftInstallation] = useState<MinecraftInstallation | null>(null)
   const [isDetectingMinecraft, setIsDetectingMinecraft] = useState(false)
   const [minecraftDetectionError, setMinecraftDetectionError] = useState('')
+  const [account, setAccount] = useState<AccountProfile | null>(null)
+  const [accountPanelOpen, setAccountPanelOpen] = useState(false)
+  const [accountMode, setAccountMode] = useState<'signin' | 'signup'>('signin')
+  const [accountIdentifier, setAccountIdentifier] = useState('')
+  const [accountUsername, setAccountUsername] = useState('')
+  const [accountStatus, setAccountStatus] = useState('')
+  const [desktopInstallPath, setDesktopInstallPath] = useState('')
+  const [desktopValidation, setDesktopValidation] = useState<InstallationValidation | null>(null)
+  const [desktopInstallState, setDesktopInstallState] = useState<'idle' | 'installing' | 'success' | 'error'>('idle')
+  const [desktopInstallMessage, setDesktopInstallMessage] = useState('')
+  const [desktopManifest, setDesktopManifest] = useState<SetupManifest | null>(null)
   const isDesktopApp = Boolean(window.__TAURI_INTERNALS__)
   const activeLoader = LOADER_CATEGORIES[selectedLoader]
+
+  useEffect(() => {
+    void accountService.getCurrentAccount().then(setAccount)
+  }, [])
 
   function openApp(view?: 'feedback' | 'support') {
     localStorage.setItem('modsync-landing-seen', 'true')
@@ -391,6 +438,125 @@ function App() {
   function openInstallationGuide() {
     setShowInstallationGuide(true)
     trackEvent('installation_guide_viewed', { loader: selectedLoader, minecraft_version: selectedVersion })
+  }
+
+  async function submitAccountRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const result = accountMode === 'signup'
+      ? await accountService.signUp(accountUsername.trim(), accountIdentifier.trim())
+      : await accountService.signIn(accountIdentifier.trim())
+    if (result.ok) {
+      setAccount(result.account)
+      setAccountPanelOpen(false)
+      setAccountStatus('')
+      return
+    }
+    setAccountStatus('Account service is not connected yet. No account was created and no password was stored.')
+  }
+
+  async function exportSetupManifest() {
+    const manifest: SetupManifest = {
+      format: 'modsync-setup',
+      formatVersion: 1,
+      exportedAt: new Date().toISOString(),
+      minecraft: { version: selectedVersion, loader: selectedLoader },
+      mods: downloadItems.map((item) => {
+        const sourceMod = library.find((mod) => mod.project_id === item.projectId)
+        const dependency = libraryDependencies.find((entry) => entry.projectId === item.projectId)
+        const result = compatibility[item.projectId] ?? (dependency?.version ? { status: 'compatible' as const, version: dependency.version, dependencies: [], missingDependencies: [], requiredDependencies: [] } : undefined)
+        const file = result?.version ? getJarFile(result.version) : undefined
+        return {
+          projectId: item.projectId,
+          title: sourceMod?.title ?? dependency?.title ?? item.title,
+          versionId: result?.version?.id,
+          versionNumber: result?.version?.version_number,
+          fileName: file?.filename,
+          downloadUrl: file?.url,
+          isDependency: item.isDependency,
+          dependencies: result?.requiredDependencies.map((dependency) => dependency.projectId) ?? [],
+        }
+      }),
+    }
+    const url = URL.createObjectURL(new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `modsync-${selectedVersion || 'setup'}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  async function validateDesktopPath(pathOverride?: string) {
+    const path = (pathOverride ?? desktopInstallPath).trim()
+    if (!isDesktopApp || !path) return
+    try {
+      const result = await window.__TAURI_INTERNALS__!.invoke<InstallationValidation>('validate_minecraft_directory', { path })
+      setDesktopValidation(result)
+      setDesktopInstallMessage(result.valid ? '' : result.reason ?? 'Selected directory is not a valid Minecraft installation.')
+    } catch {
+      setDesktopValidation(null)
+      setDesktopInstallMessage('The desktop installation path could not be validated.')
+    }
+  }
+
+  async function detectMinecraft() {
+    setIsDetectingMinecraft(true)
+    setMinecraftDetectionError('')
+    try {
+      if (!window.__TAURI_INTERNALS__) throw new Error('Desktop-App erforderlich')
+      const result = await window.__TAURI_INTERNALS__.invoke<MinecraftInstallation>('detect_minecraft')
+      setMinecraftInstallation(result)
+      if (result.minecraft_directory) {
+        setDesktopInstallPath(result.minecraft_directory)
+        await validateDesktopPath(result.minecraft_directory)
+      }
+    } catch (detectionError) {
+      setMinecraftDetectionError(
+        detectionError instanceof Error && detectionError.message === 'Desktop-App erforderlich'
+          ? 'Minecraft-Erkennung ist nur in der Tauri-Desktop-App verfügbar.'
+          : 'Minecraft-Installation konnte nicht geprüft werden.',
+      )
+      setMinecraftInstallation(null)
+    } finally {
+      setIsDetectingMinecraft(false)
+    }
+  }
+
+  async function importSetupManifest(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    try {
+      const parsed = JSON.parse(await file.text()) as SetupManifest
+      if (parsed.format !== 'modsync-setup' || parsed.formatVersion !== 1 || !Array.isArray(parsed.mods)) throw new Error('invalid')
+      setDesktopManifest(parsed)
+      setSelectedVersion(parsed.minecraft.version)
+      setSelectedLoader(parsed.minecraft.loader as (typeof LOADERS)[number])
+      setDesktopInstallMessage('Setup manifest loaded. Validate an installation path before installing.')
+    } catch {
+      setDesktopInstallMessage('This is not a valid ModSync setup manifest.')
+    } finally {
+      event.target.value = ''
+    }
+  }
+
+  async function installDesktopSetup() {
+    if (!isDesktopApp || !desktopValidation?.valid || !desktopManifest) return
+    setDesktopInstallState('installing')
+    setDesktopInstallMessage('Installing resolved mod files...')
+    try {
+      const result = await window.__TAURI_INTERNALS__!.invoke<DesktopInstallResult>('install_setup', { manifest: desktopManifest, installDir: desktopValidation.minecraft_directory })
+      if (result.failed.length > 0) {
+        setDesktopInstallState('error')
+        setDesktopInstallMessage(`${result.installed.length} file(s) installed; ${result.failed.length} file(s) failed.`)
+      } else {
+        setDesktopInstallState('success')
+        setDesktopInstallMessage(`${result.installed.length} file(s) installed successfully.`)
+      }
+    } catch (installError) {
+      setDesktopInstallState('error')
+      setDesktopInstallMessage(installError instanceof Error ? installError.message : 'Installation failed.')
+    }
   }
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
@@ -766,7 +932,7 @@ function App() {
   ).sort().join(',')
 
   useEffect(() => {
-    if ((activeView !== 'discover' && activeView !== 'recommendations') || !selectedVersion) {
+    if (activeView !== 'recommendations' || !selectedVersion) {
       return
     }
 
@@ -977,38 +1143,8 @@ function App() {
     })
   }
 
-  async function detectMinecraft() {
-    setIsDetectingMinecraft(true)
-    setMinecraftDetectionError('')
-    try {
-      if (!window.__TAURI_INTERNALS__) {
-        throw new Error('Desktop-App erforderlich')
-      }
-      const result = await window.__TAURI_INTERNALS__.invoke<MinecraftInstallation>('detect_minecraft')
-      setMinecraftInstallation(result)
-    } catch (detectionError) {
-      setMinecraftDetectionError(
-        detectionError instanceof Error && detectionError.message === 'Desktop-App erforderlich'
-          ? 'Die Minecraft-Erkennung ist nur in der Tauri-Desktop-App verfügbar.'
-          : 'Minecraft-Installation konnte nicht geprüft werden.',
-      )
-      setMinecraftInstallation(null)
-    } finally {
-      setIsDetectingMinecraft(false)
-    }
-  }
-
   const isSelectedModInLibrary = selectedMod ? isProjectInLibrary(selectedMod.project_id) : false
-  const visibleMods = activeView === 'search' ? mods : library
-  const versionGroups = versions.reduce<Record<string, MinecraftVersion[]>>(
-    (groups, version) => {
-      const groupName = version.id.split('.').slice(0, 2).join('.')
-      groups[groupName] = [...(groups[groupName] ?? []), version]
-      return groups
-    },
-    {},
-  )
-
+  const visibleMods = activeView === 'search' || activeView === 'discover' ? mods : library
   const requiredDependencySet = new Set<string>()
   const unavailableSet = new Set<string>()
   for (const mod of library) {
@@ -1051,6 +1187,8 @@ function App() {
   )
   const downloadItems = buildDownloadItems(compatibility)
   const dependencyCount = downloadItems.filter((item) => item.isDependency).length
+  const compatibleModCount = libraryCompatibility.filter((result) => result?.status === 'compatible').length
+  const downloadedCount = downloadItems.filter((item) => downloadStates[item.projectId] === 'success').length
 
   if (showLanding) {
     return <LandingPage onOpenApp={openApp} />
@@ -1059,54 +1197,97 @@ function App() {
   return (
     <main className="app-shell">
       <AnalyticsConsent onOpenPrivacy={() => setActiveView('privacy')} />
-      <header className="app-header">
-        <div>
-          <p className="eyebrow">ModSync</p>
-          <h1>Minecraft-Mods finden</h1>
-          <p className="subtitle">Durchsuche Modrinth für deine Version und deinen Loader.</p>
+      <aside className="app-sidebar">
+        <button className="brand-mark" type="button" onClick={() => setActiveView('library')} aria-label="ModSync Library">
+          <span>MS</span>
+          <strong>ModSync</strong>
+        </button>
+        <div className="sidebar-group">
+          <span className="sidebar-label">Mod management</span>
+          <button className={activeView === 'library' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('library')}>Library <b>{library.length}</b></button>
+          <button className={activeView === 'discover' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('discover')}>Discover Mods</button>
+          <button className={activeView === 'compatibility' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('compatibility')}>Compatibility</button>
         </div>
-        <span className="api-status">Live-Daten</span>
-      </header>
+        <div className="sidebar-group sidebar-divider">
+          <button className={activeView === 'plan' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('plan')}>Installations</button>
+          <button className={activeView === 'recommendations' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('recommendations')}>Updates</button>
+        </div>
+        <div className="sidebar-group sidebar-divider">
+          <span className="sidebar-label">Desktop</span>
+          <button className={activeView === 'desktop' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('desktop')}>Download Desktop App</button>
+        </div>
+        <div className="sidebar-group sidebar-bottom">
+          <button className={activeView === 'support' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('support')}>Settings</button>
+          <button className={activeView === 'feedback' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('feedback')}>Feedback</button>
+        </div>
+        <div className="sidebar-footer"><span className="connection-dot" /> Modrinth API <small>online</small></div>
+      </aside>
 
-      <nav className="main-nav" aria-label="Hauptnavigation">
-        <button
-          className={activeView === 'discover' ? 'nav-button active' : 'nav-button'}
-          type="button"
-          onClick={() => setActiveView('discover')}
-        >
-          Discover
-        </button>
-        <button
-          className={activeView === 'recommendations' ? 'nav-button active' : 'nav-button'}
-          type="button"
-          onClick={() => setActiveView('recommendations')}
-        >
-          Recommendations
-        </button>
-        <button
-          className={activeView === 'search' ? 'nav-button active' : 'nav-button'}
-          type="button"
-          onClick={() => setActiveView('search')}
-        >
-          Search
-        </button>
-        <button
-          className={activeView === 'library' ? 'nav-button active' : 'nav-button'}
-          type="button"
-          onClick={() => setActiveView('library')}
-        >
-          My Library <span className="library-count">{library.length}</span>
-        </button>
-        <button
-          className={activeView === 'plan' ? 'nav-button active' : 'nav-button'}
-          type="button"
-          onClick={() => setActiveView('plan')}
-        >
-          Installation Plan
-        </button>
-      </nav>
+      <div className="app-content">
+        <header className="app-header">
+          <div>
+            <p className="eyebrow">ModSync / {activeView === 'library' ? 'Library' : activeView === 'compatibility' ? 'Compatibility' : 'Workspace'}</p>
+            <h1>{activeView === 'library' ? 'Library' : activeView === 'compatibility' ? 'Compatibility' : activeView === 'plan' ? 'Installations' : activeView === 'desktop' ? 'Download Desktop App' : activeView === 'search' ? 'Search Mods' : activeView === 'recommendations' ? 'Updates' : activeView === 'support' ? 'Settings' : activeView === 'feedback' ? 'Feedback' : 'Discover Mods'}</h1>
+            <p className="subtitle">Minecraft {selectedVersion || 'version not selected'} · {selectedLoader} loader</p>
+          </div>
+          <div className="header-actions">
+            <span className="api-status"><span className="connection-dot" /> Live data</span>
+            <button type="button" className="account-button" onClick={() => { setAccountPanelOpen(true); setAccountStatus('') }}>
+              {account ? account.username : 'Sign in'}
+              {account && <span aria-hidden="true">⋮</span>}
+            </button>
+          </div>
+        </header>
 
-      <section className="installation-panel" aria-labelledby="minecraft-installation-title">
+        <section className="setup-toolbar" aria-label="Minecraft setup">
+          <div className="workflow-step"><span>1</span><label htmlFor="minecraft-version">Minecraft version</label><select id="minecraft-version" value={selectedVersion} onChange={(event) => { setCompatibility({}); setSelectedVersion(event.target.value) }} disabled={isLoadingVersions || versions.length === 0}><option value="">Select version</option>{versions.map((version) => <option key={version.id} value={version.id}>{version.id}</option>)}</select></div>
+          <div className="workflow-step"><span>2</span><label htmlFor="mod-loader">Loader</label><select id="mod-loader" value={selectedLoader} onChange={(event) => { setCompatibility({}); setSelectedLoader(event.target.value as (typeof LOADERS)[number]) }}>{LOADERS.map((loader) => <option key={loader} value={loader}>{loader}</option>)}</select></div>
+          <div className="workflow-step workflow-result"><span>3</span><div><label>Selected mods</label><strong>{library.length} mods selected</strong></div></div>
+          <div className={`setup-readiness ${readyToDownload ? 'ready' : 'attention'}`}><strong>{readyToDownload ? 'Ready to install' : unavailableCount > 0 ? `${unavailableCount} issue${unavailableCount === 1 ? '' : 's'} found` : 'Check compatibility'}</strong><small>{selectedVersion || 'Loading setup'} · {selectedLoader}</small></div>
+        </section>
+
+      {activeView === 'desktop' && (
+        <section className="desktop-page" aria-labelledby="desktop-page-title">
+          <div className="desktop-title-row">
+            <div><p className="eyebrow">Desktop application</p><h2 id="desktop-page-title">Download ModSync</h2></div>
+            <span className="desktop-status">Windows build not available yet.</span>
+          </div>
+          <div className="desktop-intro">
+            <h3>ModSync Desktop</h3>
+            <p>Choose your mods. ModSync handles the setup.</p>
+            <div className="desktop-platforms">
+              <button type="button" disabled={!DESKTOP_DOWNLOAD_URL}>Download for Windows</button>
+              <button type="button" disabled>Linux - coming later</button>
+              <button type="button" disabled>macOS - coming later</button>
+            </div>
+            <small>Windows build not available yet. Desktop installation engine: In development.</small>
+          </div>
+          <section className="desktop-section" aria-labelledby="desktop-value-title">
+            <h3 id="desktop-value-title">Why desktop?</h3>
+            <div className="desktop-current-setup"><strong>Your current setup</strong><span>Minecraft {selectedVersion || 'not selected'}</span><span>{selectedLoader}</span><span>{library.length} selected mods</span></div>
+            <ul className="desktop-capabilities"><li>Find your Minecraft installation</li><li>Download resolved mod files</li><li>Install required dependencies</li><li>Place files in the correct mods folder</li><li>Verify the final setup before launch</li></ul>
+          </section>
+          <section className="desktop-section" aria-labelledby="desktop-flow-title">
+            <h3 id="desktop-flow-title">How it works</h3>
+            <div className="desktop-flow"><div><strong>Web app</strong><span>Choose version and loader.</span><span>Choose the mods you want.</span><span>Resolve versions and dependencies.</span></div><div><strong>Desktop app</strong><span>Select a Minecraft installation.</span><span>Click Install.</span><span>ModSync installs and verifies the setup.</span></div></div>
+          </section>
+          <section className="desktop-section desktop-split" aria-label="Desktop feature status">
+            <div><h3>Available now</h3><ul><li>Search Modrinth mods</li><li>Build a local library</li><li>Check compatibility</li><li>Resolve required dependencies</li><li>Download files in the browser</li><li>Export a setup manifest</li></ul></div>
+            <div><h3>Coming to desktop</h3><ul><li>One-click setup installation</li><li>Choose from detected installations</li><li>Automatic dependency placement</li><li>Outdated mod detection and updates</li><li>Sync saved setups between devices</li></ul></div>
+          </section>
+          <div className="desktop-export-row"><div><strong>Setup manifest</strong><span>Export or open a manifest containing resolved versions, files and dependencies.</span></div><div className="desktop-manifest-actions"><button type="button" onClick={() => void exportSetupManifest()} disabled={library.length === 0 || !selectedVersion}>Download setup</button><label className="file-button">Open setup<input type="file" accept="application/json,.json" onChange={(event) => void importSetupManifest(event)} /></label></div></div>
+          {isDesktopApp && <section className="desktop-install-section" aria-labelledby="desktop-install-title">
+            <h3 id="desktop-install-title">Install setup</h3>
+            <div className="desktop-install-summary"><span>Minecraft: {(desktopManifest?.minecraft.version ?? selectedVersion) || 'not selected'}</span><span>Loader: {desktopManifest?.minecraft.loader ?? selectedLoader}</span><span>Mods: {desktopManifest?.mods.filter((mod) => !mod.isDependency).length ?? library.length}</span><span>Dependencies: {desktopManifest?.mods.filter((mod) => mod.isDependency).length ?? dependencyCount}</span></div>
+            <div className="desktop-path-row"><label htmlFor="desktop-install-path">Install to</label><input id="desktop-install-path" value={desktopInstallPath} onChange={(event) => { setDesktopInstallPath(event.target.value); setDesktopValidation(null) }} placeholder="Path to .minecraft" /><button type="button" onClick={() => void validateDesktopPath()}>Validate</button><button type="button" onClick={() => void detectMinecraft()} disabled={isDetectingMinecraft}>{isDetectingMinecraft ? 'Detecting...' : 'Detect default'}</button></div>
+            {desktopValidation && <p className={desktopValidation.valid ? 'message success-message' : 'message error-message'}>{desktopValidation.valid ? `Valid Minecraft installation: ${desktopValidation.mods_directory}` : desktopValidation.reason}</p>}
+            {desktopInstallMessage && <p className={`message ${desktopInstallState === 'success' ? 'success-message' : desktopInstallState === 'error' ? 'error-message' : ''}`} role="status">{desktopInstallMessage}</p>}
+            <button type="button" onClick={() => void installDesktopSetup()} disabled={!desktopManifest || !desktopValidation?.valid || desktopInstallState === 'installing'}>{desktopInstallState === 'installing' ? 'Installing...' : 'Install'}</button>
+          </section>}
+        </section>
+      )}
+
+      {activeView === 'plan' && <section className="installation-panel" aria-labelledby="minecraft-installation-title">
         <div className="section-heading">
           <h2 id="minecraft-installation-title">Minecraft Installation</h2>
           <button type="button" onClick={detectMinecraft} disabled={!isDesktopApp || isDetectingMinecraft}>
@@ -1125,9 +1306,42 @@ function App() {
             <span>Versions folder: {minecraftInstallation.versions_directory ?? 'Nicht vorhanden'}</span>
           </div>
         )}
-      </section>
+      </section>}
 
-      {activeView === 'search' && (
+      {activeView === 'compatibility' && (
+        <section className="compatibility-overview" aria-labelledby="compatibility-overview-title">
+          <div className="overview-heading">
+            <div>
+              <span className="eyebrow">Step 4 / Review</span>
+              <h2 id="compatibility-overview-title">Compatibility overview</h2>
+            </div>
+            <button type="button" className="secondary-button" onClick={() => void checkCompatibility()} disabled={isCheckingCompatibility || !selectedVersion || library.length === 0}>
+              {isCheckingCompatibility ? 'Checking ...' : 'Run check'}
+            </button>
+          </div>
+          <div className="overview-stats">
+            <div><strong>{library.length}</strong><span>Selected mods</span></div>
+            <div><strong className="status-good">{libraryCompatibility.filter((result) => result?.status === 'compatible').length}</strong><span>Compatible</span></div>
+            <div><strong>{requiredDependencyCount}</strong><span>Dependencies detected</span></div>
+            <div><strong className={unavailableCount > 0 ? 'status-bad' : 'status-good'}>{unavailableCount}</strong><span>Conflicts / issues</span></div>
+          </div>
+          {library.length === 0 && <p className="overview-empty">Add mods from Discover Mods to review this configuration.</p>}
+          {library.length > 0 && unavailableCount === 0 && libraryCompatibility.length === library.length && <p className="overview-message status-good">✓ Configuration compatible with Minecraft {selectedVersion} / {selectedLoader}</p>}
+          {(unavailableCount > 0 || libraryDependencies.length > 0) && (
+            <div className="overview-issues">
+              {library.map((mod) => {
+                const result = compatibility[mod.project_id]
+                if (result?.status === 'compatible' && result.version && getJarFile(result.version)) return null
+                return <div className="overview-issue" key={mod.project_id}><span className="status-bad">✕</span><div><strong>{mod.title}</strong><span>{result?.status === 'error' ? result.error : `No compatible version for Minecraft ${selectedVersion}`}</span></div><button type="button" className="text-button" onClick={() => setActiveView('search')}>Find version</button></div>
+              })}
+              {missingLibraryDependencies.map((dependency) => <div className="overview-issue" key={dependency.projectId}><span className="status-warn">⚠</span><div><strong>{dependency.title}</strong><span>Required by {dependency.requiredBy}</span></div><button type="button" className="text-button" onClick={() => void addDependenciesToLibrary([dependency])}>Add dependency</button></div>)}
+              {libraryDependencies.filter((dependency) => isProjectInLibrary(dependency.projectId) && dependency.version && dependency.file).map((dependency) => <div className="overview-issue" key={`${dependency.projectId}-resolved`}><span className="status-good">✓</span><div><strong>{dependency.title}</strong><span>Resolved dependency · Required by {dependency.requiredBy}</span></div></div>)}
+            </div>
+          )}
+        </section>
+      )}
+
+      {(activeView === 'search' || activeView === 'discover') && (
         <section className="controls" aria-label="Suchfilter">
           <form className="search-form" onSubmit={handleSubmit}>
             <label htmlFor="mod-search">Mod suchen</label>
@@ -1143,47 +1357,6 @@ function App() {
             </div>
           </form>
 
-          <div className="select-group">
-            <label htmlFor="minecraft-version">Minecraft Java</label>
-            <select
-              id="minecraft-version"
-              value={selectedVersion}
-              onChange={(event) => {
-                setCompatibility({})
-                setSelectedVersion(event.target.value)
-              }}
-              disabled={isLoadingVersions || versions.length === 0}
-            >
-              {isLoadingVersions && <option>Versionen werden geladen ...</option>}
-              {Object.entries(versionGroups).map(([groupName, groupVersions]) => (
-                <optgroup key={groupName} label={`Minecraft ${groupName}`}>
-                  {groupVersions.map((version) => (
-                    <option key={version.id} value={version.id}>
-                      {version.id}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-          </div>
-
-          <div className="select-group">
-            <label htmlFor="mod-loader">Loader</label>
-            <select
-              id="mod-loader"
-              value={selectedLoader}
-              onChange={(event) => {
-                setCompatibility({})
-                setSelectedLoader(event.target.value as (typeof LOADERS)[number])
-              }}
-            >
-              {LOADERS.map((loader) => (
-                <option key={loader} value={loader}>
-                  {loader}
-                </option>
-              ))}
-            </select>
-          </div>
         </section>
       )}
 
@@ -1256,7 +1429,7 @@ function App() {
             {activeView === 'plan' && (
               <section className="installation-panel" aria-labelledby="plan-title">
                 <div className="section-heading">
-                  <h2 id="plan-title">Installation Plan</h2>
+                  <div><span className="eyebrow">Step 5 / Install</span><h2 id="plan-title">Installation Plan</h2></div>
                   {library.length > 0 && (
                     <button
                       type="button"
@@ -1269,11 +1442,19 @@ function App() {
                 </div>
 
                 <div className="installation-notice">
-                  <strong>💡 Using ModSync in your browser?</strong>
+                  <strong>Browser installation</strong>
                   <p>ModSync can download your mods, but the browser cannot automatically place them into your Minecraft mods folder.</p>
                   <button type="button" className="secondary-button" onClick={openInstallationGuide}>
                     View installation guide
                   </button>
+                </div>
+
+                <div className="installation-steps" aria-label="Installation progress">
+                  <div className={selectedVersion && library.length > 0 ? 'installation-step complete' : 'installation-step'}><span>✓</span><strong>Resolve mod versions</strong><small>{selectedVersion || 'Select a Minecraft version'}</small></div>
+                  <div className={library.length > 0 && compatibleModCount === library.length ? 'installation-step complete' : 'installation-step'}><span>✓</span><strong>Check dependencies</strong><small>{requiredDependencyCount} required</small></div>
+                  <div className={downloadedCount === downloadItems.length && downloadItems.length > 0 ? 'installation-step complete' : 'installation-step'}><span>{downloadProgress ? '→' : '○'}</span><strong>Download files</strong><small>{downloadedCount} / {downloadItems.length} completed</small></div>
+                  <div className="installation-step"><span>○</span><strong>Move files to the mods folder</strong><small>Use the installation guide after downloading</small></div>
+                  <div className="installation-step"><span>○</span><strong>Verify Minecraft setup</strong><small>{selectedLoader} · Minecraft {selectedVersion || 'not selected'}</small></div>
                 </div>
 
                 <div className="setup-summary" aria-live="polite">
@@ -1298,7 +1479,7 @@ function App() {
                     <strong>{unavailableCount}</strong>
                   </div>
                   <div className={`summary-status ${readyToDownload ? 'ready' : 'action'}`}>
-                    {readyToDownload ? '✓ Ready to download' : '⚠ Action required'}
+                    {readyToDownload ? 'Ready to download' : 'Action required'}
                   </div>
                 </div>
 
@@ -1383,18 +1564,18 @@ function App() {
         )
       })()}
 
-      {!['plan', 'feedback', 'support', 'privacy'].includes(activeView) && (
+      {!['plan', 'compatibility', 'desktop', 'feedback', 'support', 'privacy'].includes(activeView) && (
         <section className="results" aria-live="polite">
           <div className="section-heading">
             <div>
-              <h2>{activeView === 'search' ? 'Search' : activeView === 'discover' ? 'Discover' : activeView === 'recommendations' ? 'Recommendations' : 'My Library'}</h2>
-              {(activeView === 'discover' || activeView === 'recommendations') && (
+              <h2>{activeView === 'search' ? 'Search' : activeView === 'discover' ? 'Discover Mods' : activeView === 'recommendations' ? 'Recommendations' : 'Library'}</h2>
+              {activeView === 'recommendations' && (
                 <p className="section-subtitle">
-                  {activeView === 'discover' ? 'Explore popular and interesting Minecraft mods.' : 'Mods selected for your current setup.'}
+                  Mods selected for your current setup.
                 </p>
               )}
             </div>
-              {(activeView === 'discover' || activeView === 'recommendations') && (
+              {activeView === 'recommendations' && (
               <button type="button" onClick={() => setRecommendationRefresh((current) => current + 1)} disabled={isLoadingRecommendations}>
                 {isLoadingRecommendations ? 'Refreshing ...' : 'Refresh recommendations'}
               </button>
@@ -1402,6 +1583,7 @@ function App() {
             {activeView === 'library' && (
               <div className="library-actions">
                 <span>{library.length} gespeichert</span>
+                <button type="button" className="secondary-button" onClick={() => setActiveView('discover')}>+ Add mod</button>
                 <button
                   type="button"
                   onClick={() => void downloadAll()}
@@ -1424,38 +1606,22 @@ function App() {
           </div>
 
           {activeView === 'library' && (
-            <div className="setup-summary compact" aria-live="polite">
-              <div className="summary-item">
-                <span className="summary-label">Minecraft</span>
-                <strong>{selectedVersion}</strong>
+            <>
+              <div className="library-context" aria-label="Current Minecraft setup">
+                <span><strong>Minecraft</strong> {selectedVersion || 'Loading'}</span>
+                <span><strong>Loader</strong> {selectedLoader}</span>
+                <span><strong>Mods</strong> {library.length}</span>
+                <span className={readyToDownload ? 'status-good' : 'status-warn'}><strong>Status</strong> {readyToDownload ? 'Ready' : 'Needs review'}</span>
               </div>
-              <div className="summary-item">
-                <span className="summary-label">Loader</span>
-                <strong>{selectedLoader}</strong>
-              </div>
-              <div className="summary-item">
-                <span className="summary-label">Mods</span>
-                <strong>{library.length}</strong>
-              </div>
-              <div className="summary-item">
-                <span className="summary-label">Required dependencies</span>
-                <strong>{requiredDependencyCount}</strong>
-              </div>
-              <div className="summary-item">
-                <span className="summary-label">Unavailable</span>
-                <strong>{unavailableCount}</strong>
-              </div>
-              <div className={`summary-status ${readyToDownload ? 'ready' : 'action'}`}>
-                {readyToDownload ? '✓ Ready to download' : '⚠ Action required'}
-              </div>
-            </div>
+              <div className="mod-table-header" aria-hidden="true"><span>Mod</span><span>Version</span><span>Loader</span><span>Minecraft</span><span>Status</span><span>Action</span></div>
+            </>
           )}
 
-          {activeView === 'search' && error && <p className="message error-message">{error}</p>}
-          {activeView === 'search' && isLoadingMods && <p className="message">Suche auf Modrinth ...</p>}
-          {(activeView === 'discover' || activeView === 'recommendations') && recommendationError && <p className="message error-message">{recommendationError}</p>}
-          {(activeView === 'discover' || activeView === 'recommendations') && isLoadingRecommendations && <p className="message">Finding recommendations ...</p>}
-          {(activeView === 'discover' || activeView === 'recommendations') && !isLoadingRecommendations && !recommendationError && recommendationGroups.length === 0 && (
+          {(activeView === 'search' || activeView === 'discover') && error && <p className="message error-message">{error}</p>}
+          {(activeView === 'search' || activeView === 'discover') && isLoadingMods && <p className="message">Suche auf Modrinth ...</p>}
+          {activeView === 'recommendations' && recommendationError && <p className="message error-message">{recommendationError}</p>}
+          {activeView === 'recommendations' && isLoadingRecommendations && <p className="message">Finding recommendations ...</p>}
+          {activeView === 'recommendations' && !isLoadingRecommendations && !recommendationError && recommendationGroups.length === 0 && (
             <p className="message">Keine kompatiblen Empfehlungen für diese Version und diesen Loader gefunden.</p>
           )}
           {activeView === 'recommendations' && library.length === 0 && !isLoadingRecommendations && (
@@ -1468,13 +1634,13 @@ function App() {
           )}
           {!isLoadingMods && !error && visibleMods.length === 0 && (
             <p className="message">
-              {activeView === 'search'
+              {activeView === 'search' || activeView === 'discover'
                 ? 'Keine Mods für diese Suche, Version und Loader gefunden.'
                 : 'Deine Bibliothek ist noch leer.'}
             </p>
           )}
 
-          {activeView === 'discover' || activeView === 'recommendations' ? (
+          {activeView === 'recommendations' ? (
             <div className="recommendation-groups">
               {recommendationGroups.map((group) => {
                 const compatibleMods = group.mods.filter(
@@ -1497,7 +1663,7 @@ function App() {
                         const inLibrary = library.some((libraryMod) => libraryMod.project_id === mod.project_id)
                         return (
                           <article
-                            className="mod-card"
+                            className="mod-card recommendation-row"
                             key={mod.project_id}
                             tabIndex={0}
                             role="button"
@@ -1556,6 +1722,41 @@ function App() {
                 )
               })}
             </div>
+          ) : activeView === 'library' ? (
+          <div className="library-table" role="table" aria-label="Mod library">
+            {visibleMods.map((mod) => {
+              const result = compatibility[mod.project_id]
+              const status = result?.status === 'compatible'
+                ? getMissingDependencies(result).length > 0 ? 'Dependency' : 'Compatible'
+                : result?.status === 'not-compatible' ? 'Incompatible' : result?.status === 'error' ? 'Error' : 'Checking'
+              const statusClass = status === 'Compatible' ? 'compatible' : status === 'Dependency' ? 'dependency' : status === 'Checking' ? 'checking' : 'incompatible'
+              return (
+                <div
+                  className="library-item"
+                  key={mod.project_id}
+                  tabIndex={0}
+                  role="row"
+                  onClick={() => viewMod(mod)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') viewMod(mod)
+                  }}
+                >
+                  <div className="library-name" role="cell">
+                    {mod.icon_url ? <img className="library-icon" src={mod.icon_url} alt="" /> : <span className="library-icon icon-placeholder" aria-hidden="true" />}
+                    <strong>{mod.title}</strong>
+                  </div>
+                  <span role="cell">{result?.version?.version_number ?? '—'}</span>
+                  <span role="cell">{selectedLoader}</span>
+                  <span role="cell">{selectedVersion || '—'}</span>
+                  <span className={`library-status ${statusClass}`} role="cell">{status === 'Compatible' || status === 'Dependency' ? '✓' : status === 'Checking' ? '…' : '!' } {status}</span>
+                  <div className="library-item-actions" role="cell">
+                    <button type="button" onClick={(event) => { event.stopPropagation(); viewMod(mod) }}>Details</button>
+                    <button type="button" aria-label={`Remove ${mod.title}`} onClick={(event) => { event.stopPropagation(); removeFromLibrary(mod.project_id) }}>×</button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
           ) : (
           <div className="mod-grid">
             {visibleMods.map((mod) => (
@@ -1589,9 +1790,9 @@ function App() {
                           <div className="compatibility-details">
                             <strong className={`compatibility-status ${result.status}`}>
                               {result.status === 'compatible' &&
-                                (getMissingDependencies(result).length > 0 ? '⚠ Missing required dependencies' : '🟢 Compatible')}
-                              {result.status === 'not-compatible' && '🔴 Not compatible'}
-                              {result.status === 'error' && '⚠️ Prüfung fehlgeschlagen'}
+                                (getMissingDependencies(result).length > 0 ? 'Missing required dependencies' : 'Compatible')}
+                              {result.status === 'not-compatible' && 'Not compatible'}
+                              {result.status === 'error' && 'Compatibility check failed'}
                             </strong>
                             {result.version && (
                               <>
@@ -1737,18 +1938,6 @@ function App() {
                             ))}
                         </div>
                       </div>
-                      {activeView === 'library' && (
-                        <button
-                          className="remove-button"
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            removeFromLibrary(mod.project_id)
-                          }}
-                        >
-                          Entfernen
-                        </button>
-                      )}
                     </>
                   )
                 })()}
@@ -1782,6 +1971,31 @@ function App() {
             </section>
           )}
         </section>
+      )}
+
+      {accountPanelOpen && (
+        <div className="modal-backdrop" onClick={() => setAccountPanelOpen(false)}>
+          <div className="account-panel" role="dialog" aria-modal="true" aria-labelledby="account-panel-title" onClick={(event) => event.stopPropagation()}>
+            <button className="close-button" type="button" aria-label="Account dialog schließen" onClick={() => setAccountPanelOpen(false)}>×</button>
+            <p className="eyebrow">Account</p>
+            <h2 id="account-panel-title">Save and sync setups</h2>
+            {account ? (
+              <>
+                <p>Signed in as {account.username}.</p>
+                <button type="button" onClick={() => { void accountService.signOut(); setAccount(null); setAccountPanelOpen(false) }}>Log out</button>
+              </>
+            ) : (
+              <form className="account-form" onSubmit={submitAccountRequest}>
+                <p>Sign in to save mod libraries and sync setups between devices. Authentication is not connected yet.</p>
+                <label htmlFor="account-identifier">Email or username</label>
+                <input id="account-identifier" value={accountIdentifier} onChange={(event) => setAccountIdentifier(event.target.value)} autoComplete="username" required />
+                {accountMode === 'signup' && <><label htmlFor="account-username">Display name</label><input id="account-username" value={accountUsername} onChange={(event) => setAccountUsername(event.target.value)} required /></>}
+                {accountStatus && <p className="message error-message" role="alert">{accountStatus}</p>}
+                <div className="account-form-actions"><button type="submit">{accountMode === 'signup' ? 'Create account' : 'Sign in'}</button><button type="button" className="secondary-button" onClick={() => { setAccountMode((current) => current === 'signin' ? 'signup' : 'signin'); setAccountStatus('') }}>{accountMode === 'signup' ? 'Use sign in' : 'Create account'}</button></div>
+              </form>
+            )}
+          </div>
+        </div>
       )}
 
       {selectedMod && (
@@ -1881,6 +2095,7 @@ function App() {
         </div>
       )}
 
+      </div>
       <footer className="app-footer">
         <p>ModSync is currently in beta. Found a bug or have an idea? <button type="button" className="text-button" onClick={() => openFeedback('General feedback')}>Send us feedback</button></p>
         <nav aria-label="Help links">
