@@ -202,17 +202,12 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
     Ok(InstallResult { installed, failed })
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![detect_minecraft, validate_minecraft_directory, install_setup])
-        .run(tauri::generate_context!())
-        .expect("error while running ModSync");
-}
-
-fn main() {
-    run();
-}
+#[tauri::command]
+fn read_installed_setup(install_dir: String) -> Result<Option<SetupManifest>, String> {
+    let path = PathBuf::from(install_dir).join(".modsync").join("installed-setup.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
     let content = fs::read_to_string(path).map_err(|error| format!("Could not read installed setup: {error}"))?;
     serde_json::from_str(&content).map(Some).map_err(|error| format!("Installed setup metadata is invalid: {error}"))
 }
