@@ -212,7 +212,7 @@ pub fn run() {
 
 fn main() {
     run();
-}    }
+}
     let content = fs::read_to_string(path).map_err(|error| format!("Could not read installed setup: {error}"))?;
     serde_json::from_str(&content).map(Some).map_err(|error| format!("Installed setup metadata is invalid: {error}"))
 }
