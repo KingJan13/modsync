@@ -57,6 +57,13 @@ struct InstallFailure {
 struct InstallResult {
     installed: Vec<String>,
     failed: Vec<InstallFailure>,
+    verified: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledModFile {
+    file_name: String,
+    path: String,
 }
 
 fn existing_path(path: PathBuf) -> Option<String> {
@@ -165,6 +172,7 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
         .map_err(|error| format!("Could not start download client: {error}"))?;
     let mut installed = Vec::new();
     let mut failed = Vec::new();
+    let mut verified = Vec::new();
 
     for item in &manifest.mods {
         let file_name = item.file_name.clone().unwrap_or_default();
@@ -197,9 +205,49 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
             continue;
         }
         installed.push(file_name);
+        if destination.is_file() {
+            verified.push(destination.file_name().unwrap().to_string_lossy().into_owned());
+        }
     }
 
-    Ok(InstallResult { installed, failed })
+    if failed.is_empty() {
+        let metadata_directory = PathBuf::from(&install_dir).join(".modsync");
+        fs::create_dir_all(&metadata_directory)
+            .map_err(|error| format!("Could not create ModSync metadata folder: {error}"))?;
+        let metadata_path = metadata_directory.join("installed-setup.json");
+        let metadata = serde_json::to_string_pretty(&manifest)
+            .map_err(|error| format!("Could not serialize setup metadata: {error}"))?;
+        fs::write(metadata_path, metadata)
+            .map_err(|error| format!("Could not save setup metadata: {error}"))?;
+    }
+
+    Ok(InstallResult { installed, failed, verified })
+}
+
+#[tauri::command]
+fn scan_installed_mods(install_dir: String) -> Result<Vec<InstalledModFile>, String> {
+    let validation = validate_directory(&install_dir);
+    if !validation.valid {
+        return Err(validation.reason.unwrap_or_else(|| "Invalid Minecraft installation.".to_string()));
+    }
+    let mods_directory = PathBuf::from(validation.mods_directory);
+    let entries = fs::read_dir(&mods_directory)
+        .map_err(|error| format!("Could not read mods folder: {error}"))?;
+    let mut mods = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not inspect mods folder: {error}"))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("jar")) {
+            if let Some(file_name) = path.file_name() {
+                mods.push(InstalledModFile {
+                    file_name: file_name.to_string_lossy().into_owned(),
+                    path: path.to_string_lossy().into_owned(),
+                });
+            }
+        }
+    }
+    mods.sort_by(|left, right| left.file_name.to_lowercase().cmp(&right.file_name.to_lowercase()));
+    Ok(mods)
 }
 
 #[tauri::command]
@@ -215,11 +263,12 @@ fn read_installed_setup(install_dir: String) -> Result<Option<SetupManifest>, St
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![detect_minecraft, validate_minecraft_directory, install_setup, read_installed_setup])
+        .invoke_handler(tauri::generate_handler![detect_minecraft, validate_minecraft_directory, install_setup, read_installed_setup, scan_installed_mods])
         .run(tauri::generate_context!())
         .expect("error while running ModSync");
 }
 
+#[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
     run();
 }

@@ -246,6 +246,12 @@ type InstallationValidation = {
 type DesktopInstallResult = {
   installed: string[]
   failed: Array<{ fileName: string; reason: string }>
+  verified: string[]
+}
+
+type InstalledModFile = {
+  file_name: string
+  path: string
 }
 
 declare global {
@@ -414,6 +420,9 @@ function App() {
   const [desktopInstallState, setDesktopInstallState] = useState<'idle' | 'installing' | 'success' | 'error'>('idle')
   const [desktopInstallMessage, setDesktopInstallMessage] = useState('')
   const [desktopManifest, setDesktopManifest] = useState<SetupManifest | null>(null)
+  const [scannedMods, setScannedMods] = useState<InstalledModFile[]>([])
+  const [isScanningMods, setIsScanningMods] = useState(false)
+  const [scanMessage, setScanMessage] = useState('')
   const isDesktopApp = Boolean(window.__TAURI_INTERNALS__)
   const activeLoader = LOADER_CATEGORIES[selectedLoader]
 
@@ -454,8 +463,8 @@ function App() {
     setAccountStatus('Account service is not connected yet. No account was created and no password was stored.')
   }
 
-  async function exportSetupManifest() {
-    const manifest: SetupManifest = {
+  function createSetupManifest(): SetupManifest {
+    return {
       format: 'modsync-setup',
       formatVersion: 1,
       exportedAt: new Date().toISOString(),
@@ -477,6 +486,10 @@ function App() {
         }
       }),
     }
+  }
+
+  async function exportSetupManifest() {
+    const manifest = createSetupManifest()
     const url = URL.createObjectURL(new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }))
     const link = document.createElement('a')
     link.href = url
@@ -510,6 +523,14 @@ function App() {
       if (result.minecraft_directory) {
         setDesktopInstallPath(result.minecraft_directory)
         await validateDesktopPath(result.minecraft_directory)
+        const installedSetup = await window.__TAURI_INTERNALS__.invoke<SetupManifest | null>('read_installed_setup', { installDir: result.minecraft_directory })
+        if (installedSetup) {
+          setDesktopManifest(installedSetup)
+          setSelectedVersion(installedSetup.minecraft.version)
+          if (LOADERS.includes(installedSetup.minecraft.loader as (typeof LOADERS)[number])) {
+            setSelectedLoader(installedSetup.minecraft.loader as (typeof LOADERS)[number])
+          }
+        }
       }
     } catch (detectionError) {
       setMinecraftDetectionError(
@@ -541,22 +562,64 @@ function App() {
   }
 
   async function installDesktopSetup() {
-    if (!isDesktopApp || !desktopValidation?.valid || !desktopManifest) return
+    if (!isDesktopApp || !desktopValidation?.valid) return
+    const manifest = desktopManifest ?? createSetupManifest()
+    if (manifest.mods.length === 0) {
+      setDesktopInstallState('error')
+      setDesktopInstallMessage('Add at least one compatible mod before installing.')
+      return
+    }
     setDesktopInstallState('installing')
     setDesktopInstallMessage('Installing resolved mod files...')
     try {
-      const result = await window.__TAURI_INTERNALS__!.invoke<DesktopInstallResult>('install_setup', { manifest: desktopManifest, installDir: desktopValidation.minecraft_directory })
+      const result = await window.__TAURI_INTERNALS__!.invoke<DesktopInstallResult>('install_setup', { manifest, installDir: desktopValidation.minecraft_directory })
       if (result.failed.length > 0) {
         setDesktopInstallState('error')
         setDesktopInstallMessage(`${result.installed.length} file(s) installed; ${result.failed.length} file(s) failed.`)
       } else {
         setDesktopInstallState('success')
-        setDesktopInstallMessage(`${result.installed.length} file(s) installed successfully.`)
+        setDesktopInstallMessage(`Setup installed: ${result.installed.length} file(s) installed, ${result.verified.length} verified.`)
       }
     } catch (installError) {
       setDesktopInstallState('error')
       setDesktopInstallMessage(installError instanceof Error ? installError.message : 'Installation failed.')
     }
+  }
+
+  async function scanMinecraftMods() {
+    if (!isDesktopApp || !desktopValidation?.valid) return
+    setIsScanningMods(true)
+    setScanMessage('Scanning the selected mods folder...')
+    try {
+      const result = await window.__TAURI_INTERNALS__!.invoke<InstalledModFile[]>('scan_installed_mods', { installDir: desktopValidation.minecraft_directory })
+      setScannedMods(result)
+      const knownFileNames = new Set(downloadItems.map((item) => item.file.filename))
+      const knownCount = result.filter((file) => knownFileNames.has(file.file_name)).length
+      setScanMessage(`${knownCount} known file(s) found; ${result.length - knownCount} unknown JAR(s) left unmatched.`)
+    } catch (scanError) {
+      setScannedMods([])
+      setScanMessage(scanError instanceof Error ? scanError.message : 'The mods folder could not be scanned.')
+    } finally {
+      setIsScanningMods(false)
+    }
+  }
+
+  function importScannedMods() {
+    const candidates = [...library, ...mods, ...recommendationGroups.flatMap((group) => group.mods)]
+    const uniqueCandidates = [...new Map(candidates.map((mod) => [mod.project_id, mod])).values()]
+    const matched = uniqueCandidates.filter((mod) => {
+      const result = compatibility[mod.project_id]
+      const file = result?.version ? getJarFile(result.version) : undefined
+      return file && scannedMods.some((installed) => installed.file_name === file.filename)
+    })
+    const newMods = matched.filter((mod) => !isProjectInLibrary(mod.project_id))
+    if (newMods.length === 0) {
+      setScanMessage('No reliably matched new mods were found to import.')
+      return
+    }
+    setLibrary((current) => [...current, ...newMods])
+    setLibraryFeedback(`${newMods.length} existing mod(s) imported into My Library.`)
+    setScanMessage(`${newMods.length} mod(s) imported. Run the compatibility check to find missing dependencies.`)
   }
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
@@ -1214,7 +1277,7 @@ function App() {
         </div>
         <div className="sidebar-group sidebar-divider">
           <span className="sidebar-label">Desktop</span>
-          <button className={activeView === 'desktop' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('desktop')}>Download Desktop App</button>
+          {!isDesktopApp && <button className={activeView === 'desktop' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('desktop')}>Download Desktop App</button>}
         </div>
         <div className="sidebar-group sidebar-bottom">
           <button className={activeView === 'support' ? 'sidebar-link active' : 'sidebar-link'} type="button" onClick={() => setActiveView('support')}>Settings</button>
@@ -1232,10 +1295,7 @@ function App() {
           </div>
           <div className="header-actions">
             <span className="api-status"><span className="connection-dot" /> Live data</span>
-            <button type="button" className="account-button" onClick={() => { setAccountPanelOpen(true); setAccountStatus('') }}>
-              {account ? account.username : 'Sign in'}
-              {account && <span aria-hidden="true">⋮</span>}
-            </button>
+            {account ? <span className="account-button">{account.username}</span> : <span className="account-unavailable">Accounts unavailable in beta</span>}
           </div>
         </header>
 
@@ -1304,6 +1364,31 @@ function App() {
             <span>Minecraft directory: {minecraftInstallation.minecraft_directory ?? 'Nicht vorhanden'}</span>
             <span>Mods folder: {minecraftInstallation.mods_directory ?? 'Nicht vorhanden'}</span>
             <span>Versions folder: {minecraftInstallation.versions_directory ?? 'Nicht vorhanden'}</span>
+          </div>
+        )}
+        {isDesktopApp && (
+          <div className="desktop-install-controls">
+            <div className="desktop-path-row">
+              <label htmlFor="installation-path">Install to</label>
+              <input id="installation-path" value={desktopInstallPath} onChange={(event) => { setDesktopInstallPath(event.target.value); setDesktopValidation(null) }} placeholder="Path to .minecraft" />
+              <button type="button" onClick={() => void validateDesktopPath()}>Validate</button>
+              <button type="button" onClick={() => void detectMinecraft()} disabled={isDetectingMinecraft}>Detect default</button>
+            </div>
+            {desktopValidation && <p className={desktopValidation.valid ? 'message success-message' : 'message error-message'}>{desktopValidation.valid ? `Valid Minecraft installation: ${desktopValidation.mods_directory}` : desktopValidation.reason}</p>}
+            <div className="setup-summary compact">
+              <div className="summary-item"><span className="summary-label">Minecraft</span><strong>{selectedVersion || 'Not selected'}</strong></div>
+              <div className="summary-item"><span className="summary-label">Loader</span><strong>{selectedLoader}</strong></div>
+              <div className="summary-item"><span className="summary-label">Selected mods</span><strong>{library.length}</strong></div>
+              <div className="summary-item"><span className="summary-label">Required dependencies</span><strong>{requiredDependencyCount}</strong></div>
+              <div className={`summary-status ${readyToDownload ? 'ready' : 'action'}`}>{readyToDownload ? 'Ready to install' : 'Resolve issues first'}</div>
+            </div>
+            <div className="desktop-scan-row">
+              <button type="button" className="secondary-button" onClick={() => void scanMinecraftMods()} disabled={!desktopValidation?.valid || isScanningMods}>{isScanningMods ? 'Scanning...' : 'Scan existing mods'}</button>
+              {scanMessage && <p className="message" role="status">{scanMessage}</p>}
+            </div>
+            {scannedMods.length > 0 && <div className="scan-results"><strong>Existing JAR files</strong>{scannedMods.map((file) => <span key={file.path}>{file.file_name}{downloadItems.some((item) => item.file.filename === file.file_name) ? ' - matched to current setup' : ' - unknown project'}</span>)}<button type="button" className="secondary-button" onClick={importScannedMods}>Import matched mods</button></div>}
+            {desktopInstallMessage && <p className={`message ${desktopInstallState === 'success' ? 'success-message' : desktopInstallState === 'error' ? 'error-message' : ''}`} role="status">{desktopInstallMessage}</p>}
+            <button type="button" onClick={() => void installDesktopSetup()} disabled={!desktopValidation?.valid || !readyToDownload || desktopInstallState === 'installing'}>{desktopInstallState === 'installing' ? 'Installing...' : 'Install to Minecraft'}</button>
           </div>
         )}
       </section>}

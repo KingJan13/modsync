@@ -1675,6 +1675,32 @@ button:hover {
   font-size: 0.71rem;
 }
 
+.desktop-scan-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.desktop-scan-row .message {
+  margin: 0;
+}
+
+.scan-results {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  border-top: 1px solid #2a343d;
+  padding-top: 12px;
+  color: #aab7c0;
+  font-size: 0.75rem;
+}
+
+.scan-results .secondary-button {
+  justify-self: start;
+}
+
 .desktop-manifest-actions {
   display: flex;
   flex-wrap: wrap;
