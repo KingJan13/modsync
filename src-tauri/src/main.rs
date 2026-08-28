@@ -56,6 +56,7 @@ struct InstallFailure {
 #[derive(Debug, Serialize)]
 struct InstallResult {
     installed: Vec<String>,
+    already_installed: Vec<String>,
     failed: Vec<InstallFailure>,
     verified: Vec<String>,
 }
@@ -104,50 +105,45 @@ fn push_unique(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
-#[tauri::command]
-fn detect_minecraft() -> MinecraftInstallation {
+fn minecraft_installations() -> Vec<MinecraftInstallation> {
     let mut candidates = Vec::new();
 
     if let Ok(app_data) = env::var("APPDATA") {
         let app_data = PathBuf::from(app_data);
         push_unique(&mut candidates, app_data.join(".minecraft"));
-        push_unique(
-            &mut candidates,
-            app_data.join("CurseForge").join("Minecraft").join("Install"),
-        );
+        push_unique(&mut candidates, app_data.join("CurseForge").join("Minecraft").join("Install"));
     }
     if let Ok(user_profile) = env::var("USERPROFILE") {
-        push_unique(
-            &mut candidates,
-            PathBuf::from(user_profile)
-                .join("AppData")
-                .join("Roaming")
-                .join(".minecraft"),
-        );
+        push_unique(&mut candidates, PathBuf::from(user_profile).join("AppData").join("Roaming").join(".minecraft"));
     }
     if let Ok(home) = env::var("HOME") {
         push_unique(&mut candidates, PathBuf::from(home).join(".minecraft"));
     }
 
-    let minecraft_directory = candidates
-        .into_iter()
-        .find(|candidate| candidate.is_dir());
-    let mods_directory = minecraft_directory
-        .as_ref()
-        .map(|directory| directory.join("mods"))
-        .and_then(existing_path);
-    let versions_directory = minecraft_directory
-        .as_ref()
-        .map(|directory| directory.join("versions"))
-        .and_then(existing_path);
-    let minecraft_directory = minecraft_directory.and_then(existing_path);
+    candidates.into_iter().filter_map(|directory| {
+        let minecraft_directory = existing_path(directory.clone());
+        minecraft_directory.map(|minecraft_directory| MinecraftInstallation {
+            found: true,
+            mods_directory: existing_path(directory.join("mods")),
+            versions_directory: existing_path(directory.join("versions")),
+            minecraft_directory: Some(minecraft_directory),
+        })
+    }).collect()
+}
 
-    MinecraftInstallation {
-        found: minecraft_directory.is_some(),
-        minecraft_directory,
-        mods_directory,
-        versions_directory,
-    }
+#[tauri::command]
+fn detect_minecraft() -> MinecraftInstallation {
+    minecraft_installations().into_iter().next().unwrap_or(MinecraftInstallation {
+        found: false,
+        minecraft_directory: None,
+        mods_directory: None,
+        versions_directory: None,
+    })
+}
+
+#[tauri::command]
+fn detect_minecraft_installations() -> Vec<MinecraftInstallation> {
+    minecraft_installations()
 }
 
 #[tauri::command]
@@ -171,6 +167,7 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
         .build()
         .map_err(|error| format!("Could not start download client: {error}"))?;
     let mut installed = Vec::new();
+    let mut already_installed = Vec::new();
     let mut failed = Vec::new();
     let mut verified = Vec::new();
 
@@ -179,6 +176,20 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
         let url = item.download_url.clone().unwrap_or_default();
         if !safe_file_name(&file_name) || !url.starts_with("https://") {
             failed.push(InstallFailure { file_name, reason: format!("{} has no safe downloadable JAR.", item.title) });
+            continue;
+        }
+        let destination = mods_directory.join(&file_name);
+        let metadata_path = PathBuf::from(&install_dir).join(".modsync").join("installed-setup.json");
+        if destination.is_file() && item.version_id.is_some() && fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<SetupManifest>(&content).ok())
+            .is_some_and(|previous| previous.mods.iter().any(|previous_item| {
+                previous_item.file_name.as_deref() == Some(file_name.as_str())
+                    && previous_item.version_id == item.version_id
+            }))
+        {
+            already_installed.push(file_name.clone());
+            verified.push(file_name);
             continue;
         }
         let response = match client.get(url).send() {
@@ -199,7 +210,6 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
                 continue;
             }
         };
-        let destination = mods_directory.join(&file_name);
         if let Err(error) = fs::write(&destination, &bytes) {
             failed.push(InstallFailure { file_name, reason: format!("Could not write file: {error}") });
             continue;
@@ -221,7 +231,7 @@ fn install_setup(manifest: SetupManifest, install_dir: String) -> Result<Install
             .map_err(|error| format!("Could not save setup metadata: {error}"))?;
     }
 
-    Ok(InstallResult { installed, failed, verified })
+    Ok(InstallResult { installed, already_installed, failed, verified })
 }
 
 #[tauri::command]
@@ -263,7 +273,7 @@ fn read_installed_setup(install_dir: String) -> Result<Option<SetupManifest>, St
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![detect_minecraft, validate_minecraft_directory, install_setup, read_installed_setup, scan_installed_mods])
+        .invoke_handler(tauri::generate_handler![detect_minecraft, detect_minecraft_installations, validate_minecraft_directory, install_setup, read_installed_setup, scan_installed_mods])
         .run(tauri::generate_context!())
         .expect("error while running ModSync");
 }

@@ -17,6 +17,8 @@ type MinecraftInstallation = {
   versions_directory: string | null
 }
 
+type MinecraftInstallationList = MinecraftInstallation[]
+
 type MinecraftVersion = {
   id: string
   type: 'release' | 'snapshot' | string
@@ -245,6 +247,7 @@ type InstallationValidation = {
 
 type DesktopInstallResult = {
   installed: string[]
+  already_installed: string[]
   failed: Array<{ fileName: string; reason: string }>
   verified: string[]
 }
@@ -252,6 +255,14 @@ type DesktopInstallResult = {
 type InstalledModFile = {
   file_name: string
   path: string
+}
+
+type ModUpdate = {
+  projectId: string
+  title: string
+  installedVersion: string
+  latestVersion: ModrinthVersion
+  file: ModrinthFile
 }
 
 declare global {
@@ -407,6 +418,7 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<{ current: number; total: number } | null>(null)
   const [showInstallationGuide, setShowInstallationGuide] = useState(false)
   const [minecraftInstallation, setMinecraftInstallation] = useState<MinecraftInstallation | null>(null)
+  const [minecraftInstallations, setMinecraftInstallations] = useState<MinecraftInstallationList>([])
   const [isDetectingMinecraft, setIsDetectingMinecraft] = useState(false)
   const [minecraftDetectionError, setMinecraftDetectionError] = useState('')
   const [account, setAccount] = useState<AccountProfile | null>(null)
@@ -423,6 +435,8 @@ function App() {
   const [scannedMods, setScannedMods] = useState<InstalledModFile[]>([])
   const [isScanningMods, setIsScanningMods] = useState(false)
   const [scanMessage, setScanMessage] = useState('')
+  const [modUpdates, setModUpdates] = useState<ModUpdate[]>([])
+  const [isLoadingUpdates, setIsLoadingUpdates] = useState(false)
   const isDesktopApp = Boolean(window.__TAURI_INTERNALS__)
   const activeLoader = LOADER_CATEGORIES[selectedLoader]
 
@@ -513,12 +527,21 @@ function App() {
     }
   }
 
+  async function selectMinecraftInstallation(installation: MinecraftInstallation) {
+    if (!installation.minecraft_directory) return
+    setMinecraftInstallation(installation)
+    setDesktopInstallPath(installation.minecraft_directory)
+    await validateDesktopPath(installation.minecraft_directory)
+  }
+
   async function detectMinecraft() {
     setIsDetectingMinecraft(true)
     setMinecraftDetectionError('')
     try {
       if (!window.__TAURI_INTERNALS__) throw new Error('Desktop-App erforderlich')
-      const result = await window.__TAURI_INTERNALS__.invoke<MinecraftInstallation>('detect_minecraft')
+      const installations = await window.__TAURI_INTERNALS__.invoke<MinecraftInstallationList>('detect_minecraft_installations')
+      setMinecraftInstallations(installations)
+      const result = installations[0] ?? { found: false, minecraft_directory: null, mods_directory: null, versions_directory: null }
       setMinecraftInstallation(result)
       if (result.minecraft_directory) {
         setDesktopInstallPath(result.minecraft_directory)
@@ -539,6 +562,7 @@ function App() {
           : 'Minecraft-Installation konnte nicht geprüft werden.',
       )
       setMinecraftInstallation(null)
+      setMinecraftInstallations([])
     } finally {
       setIsDetectingMinecraft(false)
     }
@@ -569,16 +593,17 @@ function App() {
       setDesktopInstallMessage('Add at least one compatible mod before installing.')
       return
     }
+    if (!window.confirm(`Install ${manifest.mods.length} file(s) into ${desktopValidation.mods_directory}?`)) return
     setDesktopInstallState('installing')
     setDesktopInstallMessage('Installing resolved mod files...')
     try {
       const result = await window.__TAURI_INTERNALS__!.invoke<DesktopInstallResult>('install_setup', { manifest, installDir: desktopValidation.minecraft_directory })
       if (result.failed.length > 0) {
         setDesktopInstallState('error')
-        setDesktopInstallMessage(`${result.installed.length} file(s) installed; ${result.failed.length} file(s) failed.`)
+        setDesktopInstallMessage(`${result.installed.length + result.already_installed.length} file(s) ready; ${result.already_installed.length} already installed; ${result.failed.length} file(s) failed.`)
       } else {
         setDesktopInstallState('success')
-        setDesktopInstallMessage(`Setup installed: ${result.installed.length} file(s) installed, ${result.verified.length} verified.`)
+        setDesktopInstallMessage(`Setup installed: ${result.installed.length} file(s) installed, ${result.already_installed.length} already installed, ${result.verified.length} verified.`)
       }
     } catch (installError) {
       setDesktopInstallState('error')
@@ -620,6 +645,35 @@ function App() {
     setLibrary((current) => [...current, ...newMods])
     setLibraryFeedback(`${newMods.length} existing mod(s) imported into My Library.`)
     setScanMessage(`${newMods.length} mod(s) imported. Run the compatibility check to find missing dependencies.`)
+  }
+
+  async function updateMod(update: ModUpdate) {
+    if (!desktopManifest) return
+    const nextManifest: SetupManifest = {
+      ...desktopManifest,
+      exportedAt: new Date().toISOString(),
+      mods: desktopManifest.mods.map((mod) => mod.projectId === update.projectId
+        ? { ...mod, versionId: update.latestVersion.id, versionNumber: update.latestVersion.version_number, fileName: update.file.filename, downloadUrl: update.file.url }
+        : mod),
+    }
+    setDesktopManifest(nextManifest)
+    if (!isDesktopApp || !desktopValidation?.valid) {
+      setDesktopInstallMessage('Update selected. Choose a Minecraft installation to apply it.')
+      setActiveView('plan')
+      return
+    }
+    if (!window.confirm(`Update ${update.title} to ${update.latestVersion.version_number}?`)) return
+    setDesktopInstallState('installing')
+    try {
+      const result = await window.__TAURI_INTERNALS__!.invoke<DesktopInstallResult>('install_setup', { manifest: nextManifest, installDir: desktopValidation.minecraft_directory })
+      setDesktopInstallState(result.failed.length > 0 ? 'error' : 'success')
+      setDesktopInstallMessage(result.failed.length > 0
+        ? `${result.installed.length + result.already_installed.length} file(s) ready; ${result.failed.length} file(s) failed.`
+        : `${update.title} updated and ${result.verified.length} file(s) verified.`)
+    } catch (updateError) {
+      setDesktopInstallState('error')
+      setDesktopInstallMessage(updateError instanceof Error ? updateError.message : 'Update failed.')
+    }
   }
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
@@ -995,7 +1049,7 @@ function App() {
   ).sort().join(',')
 
   useEffect(() => {
-    if (activeView !== 'recommendations' || !selectedVersion) {
+    if (activeView !== 'recommendations' || !selectedVersion || desktopManifest) {
       return
     }
 
@@ -1114,7 +1168,36 @@ function App() {
 
     void loadRecommendations()
     return () => controller.abort()
-  }, [activeLoader, activeView, checkCompatibility, library, libraryDependencyKey, recommendationRefresh, selectedLoader, selectedVersion])
+  }, [activeLoader, activeView, checkCompatibility, desktopManifest, library, libraryDependencyKey, recommendationRefresh, selectedLoader, selectedVersion])
+
+  useEffect(() => {
+    if (activeView !== 'recommendations' || !desktopManifest || !selectedVersion) {
+      return
+    }
+    const controller = new AbortController()
+    async function loadModUpdates() {
+      setIsLoadingUpdates(true)
+      try {
+        const results = await Promise.all(desktopManifest!.mods.filter((mod) => !mod.isDependency).map(async (mod): Promise<ModUpdate | null> => {
+          const response = await fetch(`${MODRINTH_API}/project/${mod.projectId}/version`, { signal: controller.signal })
+          if (!response.ok) return null
+          const versions = (await response.json()) as ModrinthVersion[]
+          const latest = versions.find((version) => version.game_versions.includes(selectedVersion) && version.loaders.includes(activeLoader) && Boolean(getJarFile(version)))
+          const current = mod.versionId ?? ''
+          if (!latest || !current || latest.id === current) return null
+          const file = getJarFile(latest)
+          return file ? { projectId: mod.projectId, title: mod.title, installedVersion: mod.versionNumber ?? current, latestVersion: latest, file } : null
+        }))
+        setModUpdates(results.filter((update): update is ModUpdate => update !== null))
+      } catch (updateError) {
+        if (!(updateError instanceof DOMException && updateError.name === 'AbortError')) setModUpdates([])
+      } finally {
+        if (!controller.signal.aborted) setIsLoadingUpdates(false)
+      }
+    }
+    void loadModUpdates()
+    return () => controller.abort()
+  }, [activeLoader, activeView, desktopManifest, selectedVersion])
 
   function formatFileSize(bytes: number) {
     return `${(bytes / 1024 / 1024).toFixed(2)} MB`
@@ -1342,7 +1425,7 @@ function App() {
             <div className="desktop-path-row"><label htmlFor="desktop-install-path">Install to</label><input id="desktop-install-path" value={desktopInstallPath} onChange={(event) => { setDesktopInstallPath(event.target.value); setDesktopValidation(null) }} placeholder="Path to .minecraft" /><button type="button" onClick={() => void validateDesktopPath()}>Validate</button><button type="button" onClick={() => void detectMinecraft()} disabled={isDetectingMinecraft}>{isDetectingMinecraft ? 'Detecting...' : 'Detect default'}</button></div>
             {desktopValidation && <p className={desktopValidation.valid ? 'message success-message' : 'message error-message'}>{desktopValidation.valid ? `Valid Minecraft installation: ${desktopValidation.mods_directory}` : desktopValidation.reason}</p>}
             {desktopInstallMessage && <p className={`message ${desktopInstallState === 'success' ? 'success-message' : desktopInstallState === 'error' ? 'error-message' : ''}`} role="status">{desktopInstallMessage}</p>}
-            <button type="button" onClick={() => void installDesktopSetup()} disabled={!desktopManifest || !desktopValidation?.valid || desktopInstallState === 'installing'}>{desktopInstallState === 'installing' ? 'Installing...' : 'Install'}</button>
+            <button type="button" onClick={() => void installDesktopSetup()} disabled={!desktopValidation?.valid || !readyToDownload || desktopInstallState === 'installing'}>{desktopInstallState === 'installing' ? 'Installing...' : 'Install to Minecraft'}</button>
           </section>}
         </section>
       )}
@@ -1368,6 +1451,7 @@ function App() {
         )}
         {isDesktopApp && (
           <div className="desktop-install-controls">
+            {minecraftInstallations.length > 1 && <div className="installation-picker"><strong>Choose Minecraft installation</strong>{minecraftInstallations.map((installation) => <label key={installation.minecraft_directory}><input type="radio" name="minecraft-installation" checked={installation.minecraft_directory === minecraftInstallation?.minecraft_directory} onChange={() => void selectMinecraftInstallation(installation)} />{installation.minecraft_directory}</label>)}</div>}
             <div className="desktop-path-row">
               <label htmlFor="installation-path">Install to</label>
               <input id="installation-path" value={desktopInstallPath} onChange={(event) => { setDesktopInstallPath(event.target.value); setDesktopValidation(null) }} placeholder="Path to .minecraft" />
@@ -1725,7 +1809,14 @@ function App() {
             </p>
           )}
 
-          {activeView === 'recommendations' ? (
+          {activeView === 'recommendations' ? desktopManifest ? (
+            <section className="recommendation-groups" aria-labelledby="updates-title">
+              <div className="section-heading"><div><h2 id="updates-title">Mod updates</h2><p className="section-subtitle">Compatible updates for the saved setup.</p></div></div>
+              {isLoadingUpdates && <p className="message">Checking compatible Modrinth versions...</p>}
+              {!isLoadingUpdates && modUpdates.length === 0 && <p className="message success-message">No compatible mod updates found.</p>}
+              {!isLoadingUpdates && modUpdates.map((update) => <div className="plan-item" key={update.projectId}><span><strong>{update.title}</strong><small>Installed: {update.installedVersion} · Latest compatible: {update.latestVersion.version_number}</small></span><button type="button" onClick={() => void updateMod(update)}>Update</button></div>)}
+            </section>
+          ) : (
             <div className="recommendation-groups">
               {recommendationGroups.map((group) => {
                 const compatibleMods = group.mods.filter(

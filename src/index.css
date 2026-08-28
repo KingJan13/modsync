@@ -1683,6 +1683,31 @@ button:hover {
   margin: 12px 0;
 }
 
+.installation-picker {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  border-top: 1px solid #2a343d;
+  padding-top: 12px;
+  color: #cbd5dc;
+  font-size: 0.76rem;
+}
+
+.installation-picker label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: #aab7c0;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.installation-picker input {
+  width: auto;
+  min-height: 0;
+}
+
 .desktop-scan-row .message {
   margin: 0;
 }
